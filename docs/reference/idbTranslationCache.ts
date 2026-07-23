@@ -3,20 +3,23 @@
 // Zero-dependency IndexedDB cache for message translation results.
 // Pure module — no React / zustand imports. Values must be structured-cloneable.
 //
-// Eviction policy (this build):
-//   - Soft cap: ~50 MB (byte-based), tracked via a running total in a `meta` store.
-//   - Prune order: OLDEST FIRST by `updatedAt` (uses the byUpdatedAt index).
-//   - Prune batch: up to 10,000 entries per prune pass.
-//   - Trigger: after a write pushes totalBytes over the cap.
+// Eviction policy:
+//   - Soft cap ~50 MB (byte-based), tracked via a running total in a `meta` store.
+//   - Prune OLDEST FIRST by `updatedAt` (byUpdatedAt index), up to 10,000/pass.
+//   - Triggered after a write pushes totalBytes over the cap.
 //
-// Raw-IDB footguns handled:
-//   1. Single shared connection (don't open a DB per call).
-//   2. Never await non-IDB work inside a transaction (it auto-commits/closes).
-//   3. Multi-tab upgrades: onversionchange (close) + onblocked.
-//   4. Feature-detect + try/catch (Safari private mode / disabled storage) →
-//      degrade to "cache miss" instead of throwing.
-//   5. QuotaExceededError on write → prune then one retry.
-//   6. navigator.storage.persist() best-effort against eviction.
+// Resilience:
+//   - Feature-detect + try/catch everywhere → any failure degrades to "cache miss".
+//   - QuotaExceededError on write → prune then one retry.
+//   - Corruption self-heal: if open fails (non-VersionError), deleteDatabase once
+//     and reopen once. recoverDatabase() is also exposed for manual use.
+//   - onblocked (multi-tab upgrade/delete) → settable handler via setBlockedHandler.
+//   - onversionchange → close so another tab's upgrade isn't blocked.
+//
+// Migration:
+//   - Schema changes bump DB_VERSION; onupgradeneeded keys off event.oldVersion.
+//   - Prefer ADDITIVE + read-tolerant changes to avoid migrations.
+//   - For breaking changes, drop & rebuild is fine (losing a cache just re-translates).
 // -----------------------------------------------------------------------------
 
 export interface CachedTranslation {
@@ -40,6 +43,13 @@ const PRUNE_BATCH = 10_000;              // delete up to this many oldest per pr
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+// Called when an upgrade or delete is blocked by a connection in another tab.
+// The app can set this to, e.g., prompt "please close other tabs".
+let onBlocked: () => void = () => {};
+export function setBlockedHandler(fn: () => void): void {
+  onBlocked = fn;
+}
+
 function idbAvailable(): boolean {
   try {
     return typeof indexedDB !== 'undefined' && indexedDB !== null;
@@ -48,48 +58,115 @@ function idbAvailable(): boolean {
   }
 }
 
-// Conservative byte estimate (CJK ~2 bytes/char; + fixed overhead for field
-// names, primary key, the updatedAt index entry, and the numeric fields).
+// Conservative byte estimate (CJK ~2 bytes/char + fixed overhead).
 function estimateSize(r: Omit<CachedTranslation, 'size'>): number {
   const chars =
     r.messageId.length + r.targetLang.length + r.translatedMarkdown.length + String(r.srcVersion).length;
   return chars * 2 + 120;
 }
 
-function openDB(): Promise<IDBDatabase> {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+// ---- schema helpers (used by onupgradeneeded) -------------------------------
+
+function createStores(db: IDBDatabase): void {
+  const store = db.createObjectStore(STORE, { keyPath: 'messageId' });
+  store.createIndex(LRU_INDEX, 'updatedAt', { unique: false });
+  db.createObjectStore(META); // out-of-line keys; we use the string TOTAL_KEY
+}
+
+function dropStores(db: IDBDatabase): void {
+  for (const name of Array.from(db.objectStoreNames)) db.deleteObjectStore(name);
+}
+
+// ---- open / recover ---------------------------------------------------------
+
+function rawOpen(): Promise<IDBDatabase> {
+  return new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+
+    req.onupgradeneeded = (event) => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const store = db.createObjectStore(STORE, { keyPath: 'messageId' });
-        store.createIndex(LRU_INDEX, 'updatedAt', { unique: false });
+      const oldV = (event as IDBVersionChangeEvent).oldVersion;
+
+      if (oldV < 1) {
+        // Fresh install → create v1 schema.
+        createStores(db);
       }
-      if (!db.objectStoreNames.contains(META)) {
-        db.createObjectStore(META); // out-of-line keys; we use the string TOTAL_KEY
-      }
-      // NOTE: if you upgrade from a build without `size`/`meta`, do a one-time
-      // backfill here (scan STORE, sum estimateSize, write TOTAL_KEY).
+
+      // --- Future migrations go here, keyed by oldVersion --------------------
+      // ADDITIVE (keep data): add an index / store without touching the rest.
+      //   if (oldV >= 1 && oldV < 2) { db.createObjectStore('newThing'); }
+      //
+      // BREAKING (drop & rebuild — fine for a cache, users just re-translate):
+      //   if (oldV >= 1 && oldV < 3) { dropStores(db); createStores(db); }
+      //
+      // Backfill example (v1 had no `size`/`meta`): after createStores, scan the
+      // old store on req.transaction, sum estimateSize, write TOTAL_KEY. Keep it
+      // synchronous (enqueue IDB requests only) — no awaiting external work here.
+      // ----------------------------------------------------------------------
     };
+
     req.onsuccess = () => {
       const db = req.result;
+      // If another tab opens a newer version, close so we don't block its upgrade.
       db.onversionchange = () => {
         db.close();
         dbPromise = null;
       };
       resolve(db);
     };
-    req.onerror = () => {
-      dbPromise = null;
-      reject(req.error);
-    };
-    req.onblocked = () => {
-      /* another tab holds an older connection; it should close on versionchange */
-    };
+    req.onerror = () => reject(req.error);
+    // Our upgrade is blocked by an older connection in another tab.
+    req.onblocked = () => onBlocked();
   });
-  return dbPromise;
 }
+
+function deleteDatabaseRaw(): Promise<void> {
+  dbPromise = null;
+  return new Promise<void>((resolve) => {
+    let req: IDBOpenDBRequest;
+    try {
+      req = indexedDB.deleteDatabase(DB_NAME);
+    } catch {
+      resolve();
+      return;
+    }
+    req.onsuccess = () => resolve();
+    req.onerror = () => resolve(); // best-effort
+    req.onblocked = () => onBlocked(); // waits for other connections to close, then success fires
+  });
+}
+
+function openDB(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+  const p = rawOpen().catch(async (err: unknown) => {
+    // VersionError: a newer schema exists (another tab / newer app bundle owns it).
+    // Do NOT delete — that would destroy data the newer version needs.
+    if ((err as DOMException)?.name === 'VersionError') throw err;
+    // Otherwise treat as possible corruption: delete once and reopen once.
+    await deleteDatabaseRaw();
+    return rawOpen();
+  });
+  dbPromise = p;
+  // If it still fails, clear so a later call can retry from scratch.
+  p.catch(() => {
+    if (dbPromise === p) dbPromise = null;
+  });
+  return p;
+}
+
+/** Manually drop the whole database and reset (e.g., on detected corruption). */
+export async function recoverDatabase(): Promise<void> {
+  if (dbPromise) {
+    try {
+      (await dbPromise).close();
+    } catch {
+      /* ignore */
+    }
+  }
+  await deleteDatabaseRaw();
+}
+
+// ---- reads ------------------------------------------------------------------
 
 /** Read one message's cached translation (undefined on miss or any IDB error). */
 export async function getTranslation(messageId: string): Promise<CachedTranslation | undefined> {
@@ -131,8 +208,25 @@ export async function getManyTranslations(ids: string[]): Promise<Map<string, Ca
   return out;
 }
 
+/** Current tracked cache size in bytes (0 on error). */
+export async function getTotalBytes(): Promise<number> {
+  if (!idbAvailable()) return 0;
+  try {
+    const db = await openDB();
+    return await new Promise<number>((resolve, reject) => {
+      const tx = db.transaction(META, 'readonly');
+      const req = tx.objectStore(META).get(TOTAL_KEY);
+      tx.oncomplete = () => resolve((req.result as number) ?? 0);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    return 0;
+  }
+}
+
+// ---- writes -----------------------------------------------------------------
+
 // Internal: upsert a record and update the running total in ONE transaction.
-// Returns the new totalBytes so the caller can decide whether to prune.
 function putRecordTx(record: CachedTranslation): Promise<number> {
   return openDB().then(
     (db) =>
@@ -173,14 +267,15 @@ export async function setTranslation(
   const record: CachedTranslation = { ...base, size: estimateSize(base) };
   try {
     const total = await putRecordTx(record);
-    if (total > CAP_BYTES) void prune(); // batch-evict 10k oldest (see note below)
+    if (total > CAP_BYTES) void prune(); // batch-evict 10k oldest
   } catch {
     // Likely QuotaExceededError → free space then retry once.
     try {
       await prune();
       await putRecordTx(record);
     } catch {
-      /* give up silently; in-memory store still holds it this session */
+      // give up silently; in-memory store still holds it this session.
+      // (Persistent open failures self-heal via openDB() corruption recovery.)
     }
   }
 }
@@ -212,13 +307,11 @@ export async function deleteTranslation(messageId: string): Promise<void> {
 }
 
 /**
- * Prune OLDEST-FIRST by updatedAt, up to PRUNE_BATCH (10,000) entries in one
- * pass, and decrement the running total by the freed bytes.
- * Returns how many entries were deleted.
+ * Prune OLDEST-FIRST by updatedAt, up to PRUNE_BATCH (10,000) entries per pass,
+ * decrementing the running total by the freed bytes. Returns entries deleted.
  *
- * NOTE: one pass deletes up to 10k entries — normally far more than enough to
- * drop back under 50 MB. If you want a *hard* guarantee of being under the cap
- * even with pathologically large records, wrap the caller in:
+ * One pass normally drops well under 50 MB. For a hard guarantee under
+ * pathological record sizes, loop the caller:
  *   while ((await getTotalBytes()) > CAP_BYTES && (await prune()) > 0) {}
  */
 export async function prune(): Promise<number> {
@@ -241,29 +334,12 @@ export async function prune(): Promise<number> {
           deleted++;
           cursor.continue();
         } else {
-          // batch done → decrement running total once
           const getTotal = ms.get(TOTAL_KEY);
           getTotal.onsuccess = () =>
             ms.put(Math.max(0, ((getTotal.result as number) ?? 0) - freed), TOTAL_KEY);
         }
       };
       tx.oncomplete = () => resolve(deleted);
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch {
-    return 0;
-  }
-}
-
-/** Current tracked cache size in bytes (0 on error). */
-export async function getTotalBytes(): Promise<number> {
-  if (!idbAvailable()) return 0;
-  try {
-    const db = await openDB();
-    return await new Promise<number>((resolve, reject) => {
-      const tx = db.transaction(META, 'readonly');
-      const req = tx.objectStore(META).get(TOTAL_KEY);
-      tx.oncomplete = () => resolve(((req.result as number) ?? 0));
       tx.onerror = () => reject(tx.error);
     });
   } catch {
@@ -327,7 +403,9 @@ export async function requestPersistentStorage(): Promise<boolean> {
 // -----------------------------------------------------------------------------
 // Integration sketch (in your translation store / bubble, NOT here):
 //
-//   import { getTranslation, setTranslation, deleteTranslation, touch } from './idbTranslationCache';
+//   import { getTranslation, setTranslation, deleteTranslation, setBlockedHandler } from './idbTranslationCache';
+//
+//   setBlockedHandler(() => showToast('Please close other tabs to update translation cache.'));
 //
 //   // on translate success (inside the store's run()):
 //   setTranslation({ messageId, targetLang, translatedMarkdown: out, srcVersion }); // auto-prunes at 50MB
