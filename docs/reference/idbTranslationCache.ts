@@ -3,16 +3,20 @@
 // Zero-dependency IndexedDB cache for message translation results.
 // Pure module — no React / zustand imports. Values must be structured-cloneable.
 //
-// Handles the raw-IDB footguns:
+// Eviction policy (this build):
+//   - Soft cap: ~50 MB (byte-based), tracked via a running total in a `meta` store.
+//   - Prune order: OLDEST FIRST by `updatedAt` (uses the byUpdatedAt index).
+//   - Prune batch: up to 10,000 entries per prune pass.
+//   - Trigger: after a write pushes totalBytes over the cap.
+//
+// Raw-IDB footguns handled:
 //   1. Single shared connection (don't open a DB per call).
-//   2. Never await non-IDB work *inside* a transaction (it auto-commits/closes).
+//   2. Never await non-IDB work inside a transaction (it auto-commits/closes).
 //   3. Multi-tab upgrades: onversionchange (close) + onblocked.
 //   4. Feature-detect + try/catch (Safari private mode / disabled storage) →
-//      degrade gracefully to "cache miss" instead of throwing.
-//   5. QuotaExceededError → prune (LRU) then one retry.
-//   6. LRU eviction via an index on `updatedAt`.
-//   7. navigator.storage.persist() best-effort so the browser is less likely
-//      to evict us under storage pressure.
+//      degrade to "cache miss" instead of throwing.
+//   5. QuotaExceededError on write → prune then one retry.
+//   6. navigator.storage.persist() best-effort against eviction.
 // -----------------------------------------------------------------------------
 
 export interface CachedTranslation {
@@ -20,14 +24,19 @@ export interface CachedTranslation {
   targetLang: string;
   translatedMarkdown: string;
   srcVersion: string | number;  // message version at translate time → edit invalidation
-  updatedAt: number;            // Date.now() at last write; LRU ordering key
+  updatedAt: number;            // Date.now(); ORDERING KEY for oldest-first prune
+  size: number;                 // estimated bytes of this record (for the 50MB cap)
 }
 
 const DB_NAME = 'msg-translations';
-const DB_VERSION = 1;               // bump + handle in onupgradeneeded when schema changes
+const DB_VERSION = 1;                    // bump + migrate in onupgradeneeded on schema change
 const STORE = 'translations';
+const META = 'meta';
 const LRU_INDEX = 'byUpdatedAt';
-const MAX_ENTRIES = 5000;           // tune to your expected history size
+const TOTAL_KEY = 'totalBytes';
+
+const CAP_BYTES = 50 * 1024 * 1024;      // 50 MB soft cap
+const PRUNE_BATCH = 10_000;              // delete up to this many oldest per prune
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -35,8 +44,16 @@ function idbAvailable(): boolean {
   try {
     return typeof indexedDB !== 'undefined' && indexedDB !== null;
   } catch {
-    return false; // some privacy modes throw on mere access
+    return false;
   }
+}
+
+// Conservative byte estimate (CJK ~2 bytes/char; + fixed overhead for field
+// names, primary key, the updatedAt index entry, and the numeric fields).
+function estimateSize(r: Omit<CachedTranslation, 'size'>): number {
+  const chars =
+    r.messageId.length + r.targetLang.length + r.translatedMarkdown.length + String(r.srcVersion).length;
+  return chars * 2 + 120;
 }
 
 function openDB(): Promise<IDBDatabase> {
@@ -49,11 +66,14 @@ function openDB(): Promise<IDBDatabase> {
         const store = db.createObjectStore(STORE, { keyPath: 'messageId' });
         store.createIndex(LRU_INDEX, 'updatedAt', { unique: false });
       }
-      // If you add fields/indexes later, migrate here based on the old version.
+      if (!db.objectStoreNames.contains(META)) {
+        db.createObjectStore(META); // out-of-line keys; we use the string TOTAL_KEY
+      }
+      // NOTE: if you upgrade from a build without `size`/`meta`, do a one-time
+      // backfill here (scan STORE, sum estimateSize, write TOTAL_KEY).
     };
     req.onsuccess = () => {
       const db = req.result;
-      // If another tab opens a newer version, close so we don't block its upgrade.
       db.onversionchange = () => {
         db.close();
         dbPromise = null;
@@ -64,54 +84,30 @@ function openDB(): Promise<IDBDatabase> {
       dbPromise = null;
       reject(req.error);
     };
-    // Another tab holds an older connection open and blocks our upgrade.
     req.onblocked = () => {
-      // Best-effort: nothing to do here except wait; that tab's onversionchange
-      // should close it. Left as a hook for logging.
+      /* another tab holds an older connection; it should close on versionchange */
     };
   });
   return dbPromise;
-}
-
-/**
- * Run one transaction. `run` must ONLY enqueue IDB requests synchronously —
- * do not await anything non-IDB inside it, or the transaction auto-commits.
- * Resolves with the last request's result (or undefined for writes).
- */
-function withStore<T>(
-  mode: IDBTransactionMode,
-  run: (store: IDBObjectStore) => IDBRequest<T> | void,
-): Promise<T | undefined> {
-  return openDB().then(
-    (db) =>
-      new Promise<T | undefined>((resolve, reject) => {
-        let req: IDBRequest<T> | void;
-        const tx = db.transaction(STORE, mode);
-        const store = tx.objectStore(STORE);
-        try {
-          req = run(store);
-        } catch (e) {
-          reject(e);
-          return;
-        }
-        tx.oncomplete = () => resolve(req ? (req as IDBRequest<T>).result : undefined);
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error);
-      }),
-  );
 }
 
 /** Read one message's cached translation (undefined on miss or any IDB error). */
 export async function getTranslation(messageId: string): Promise<CachedTranslation | undefined> {
   if (!idbAvailable()) return undefined;
   try {
-    return await withStore<CachedTranslation>('readonly', (s) => s.get(messageId));
+    const db = await openDB();
+    return await new Promise<CachedTranslation | undefined>((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(messageId);
+      tx.oncomplete = () => resolve(req.result as CachedTranslation | undefined);
+      tx.onerror = () => reject(tx.error);
+    });
   } catch {
-    return undefined; // degrade: treat every failure as a cache miss
+    return undefined; // degrade: every failure is a cache miss
   }
 }
 
-/** Batch read (e.g. hydrate a whole viewport in ONE transaction). */
+/** Batch read (hydrate a whole viewport in ONE transaction). */
 export async function getManyTranslations(ids: string[]): Promise<Map<string, CachedTranslation>> {
   const out = new Map<string, CachedTranslation>();
   if (!idbAvailable() || ids.length === 0) return out;
@@ -130,27 +126,61 @@ export async function getManyTranslations(ids: string[]): Promise<Map<string, Ca
       tx.onerror = () => reject(tx.error);
     });
   } catch {
-    // degrade: return whatever we managed to collect
+    /* degrade to whatever we collected */
   }
   return out;
 }
 
-/** Upsert a translation. Stamps updatedAt (LRU). Fire-and-forget LRU prune. */
+// Internal: upsert a record and update the running total in ONE transaction.
+// Returns the new totalBytes so the caller can decide whether to prune.
+function putRecordTx(record: CachedTranslation): Promise<number> {
+  return openDB().then(
+    (db) =>
+      new Promise<number>((resolve, reject) => {
+        let newTotal = 0;
+        const tx = db.transaction([STORE, META], 'readwrite');
+        const ts = tx.objectStore(STORE);
+        const ms = tx.objectStore(META);
+        const getOld = ts.get(record.messageId);
+        getOld.onsuccess = () => {
+          const oldSize = (getOld.result as CachedTranslation | undefined)?.size ?? 0;
+          ts.put(record);
+          const getTotal = ms.get(TOTAL_KEY);
+          getTotal.onsuccess = () => {
+            newTotal = Math.max(0, ((getTotal.result as number) ?? 0) + record.size - oldSize);
+            ms.put(newTotal, TOTAL_KEY);
+          };
+        };
+        tx.oncomplete = () => resolve(newTotal);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      }),
+  );
+}
+
+/** Upsert a translation. Stamps updatedAt, tracks bytes, prunes if over 50 MB. */
 export async function setTranslation(
-  entry: Omit<CachedTranslation, 'updatedAt'> & { updatedAt?: number },
+  entry: Omit<CachedTranslation, 'updatedAt' | 'size'> & { updatedAt?: number },
 ): Promise<void> {
   if (!idbAvailable()) return;
-  const record: CachedTranslation = { ...entry, updatedAt: entry.updatedAt ?? Date.now() };
+  const base = {
+    messageId: entry.messageId,
+    targetLang: entry.targetLang,
+    translatedMarkdown: entry.translatedMarkdown,
+    srcVersion: entry.srcVersion,
+    updatedAt: entry.updatedAt ?? Date.now(),
+  };
+  const record: CachedTranslation = { ...base, size: estimateSize(base) };
   try {
-    await withStore('readwrite', (s) => s.put(record));
-    void prune(); // keep bounded; runs its own transaction
+    const total = await putRecordTx(record);
+    if (total > CAP_BYTES) void prune(); // batch-evict 10k oldest (see note below)
   } catch {
     // Likely QuotaExceededError → free space then retry once.
     try {
-      await prune(Math.floor(MAX_ENTRIES * 0.8));
-      await withStore('readwrite', (s) => s.put(record));
+      await prune();
+      await putRecordTx(record);
     } catch {
-      // Give up silently: the in-memory store still holds the value this session.
+      /* give up silently; in-memory store still holds it this session */
     }
   }
 }
@@ -159,45 +189,123 @@ export async function setTranslation(
 export async function deleteTranslation(messageId: string): Promise<void> {
   if (!idbAvailable()) return;
   try {
-    await withStore('readwrite', (s) => s.delete(messageId));
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE, META], 'readwrite');
+      const ts = tx.objectStore(STORE);
+      const ms = tx.objectStore(META);
+      const getOld = ts.get(messageId);
+      getOld.onsuccess = () => {
+        const old = getOld.result as CachedTranslation | undefined;
+        if (!old) return; // nothing to delete; tx completes
+        ts.delete(messageId);
+        const getTotal = ms.get(TOTAL_KEY);
+        getTotal.onsuccess = () =>
+          ms.put(Math.max(0, ((getTotal.result as number) ?? 0) - (old.size ?? 0)), TOTAL_KEY);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
   } catch {
     /* ignore */
   }
 }
 
-/** Wipe the whole cache. NOTE: do NOT call on logout — PRD requires manual
- *  translations to survive logout/login. Use only for explicit "clear" or migration. */
-export async function clearAll(): Promise<void> {
-  if (!idbAvailable()) return;
+/**
+ * Prune OLDEST-FIRST by updatedAt, up to PRUNE_BATCH (10,000) entries in one
+ * pass, and decrement the running total by the freed bytes.
+ * Returns how many entries were deleted.
+ *
+ * NOTE: one pass deletes up to 10k entries — normally far more than enough to
+ * drop back under 50 MB. If you want a *hard* guarantee of being under the cap
+ * even with pathologically large records, wrap the caller in:
+ *   while ((await getTotalBytes()) > CAP_BYTES && (await prune()) > 0) {}
+ */
+export async function prune(): Promise<number> {
+  if (!idbAvailable()) return 0;
   try {
-    await withStore('readwrite', (s) => s.clear());
+    const db = await openDB();
+    return await new Promise<number>((resolve, reject) => {
+      let deleted = 0;
+      let freed = 0;
+      const tx = db.transaction([STORE, META], 'readwrite');
+      const ts = tx.objectStore(STORE);
+      const ms = tx.objectStore(META);
+      const cursorReq = ts.index(LRU_INDEX).openCursor(null, 'next'); // ascending = oldest first
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor && deleted < PRUNE_BATCH) {
+          const rec = cursor.value as CachedTranslation;
+          freed += rec.size ?? estimateSize(rec);
+          cursor.delete();
+          deleted++;
+          cursor.continue();
+        } else {
+          // batch done → decrement running total once
+          const getTotal = ms.get(TOTAL_KEY);
+          getTotal.onsuccess = () =>
+            ms.put(Math.max(0, ((getTotal.result as number) ?? 0) - freed), TOTAL_KEY);
+        }
+      };
+      tx.oncomplete = () => resolve(deleted);
+      tx.onerror = () => reject(tx.error);
+    });
   } catch {
-    /* ignore */
+    return 0;
   }
 }
 
-/** LRU eviction: if count > cap, delete oldest-by-updatedAt until within cap. */
-export async function prune(cap: number = MAX_ENTRIES): Promise<void> {
+/** Current tracked cache size in bytes (0 on error). */
+export async function getTotalBytes(): Promise<number> {
+  if (!idbAvailable()) return 0;
+  try {
+    const db = await openDB();
+    return await new Promise<number>((resolve, reject) => {
+      const tx = db.transaction(META, 'readonly');
+      const req = tx.objectStore(META).get(TOTAL_KEY);
+      tx.oncomplete = () => resolve(((req.result as number) ?? 0));
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    return 0;
+  }
+}
+
+/** Bump updatedAt to now WITHOUT changing size — turns oldest-written eviction
+ *  into least-recently-VIEWED eviction. Optional: call on a cache hit. */
+export async function touch(messageId: string): Promise<void> {
   if (!idbAvailable()) return;
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        let toDelete = countReq.result - cap;
-        if (toDelete <= 0) return; // tx will complete
-        const cursorReq = store.index(LRU_INDEX).openCursor(null, 'next'); // oldest first
-        cursorReq.onsuccess = () => {
-          const cursor = cursorReq.result;
-          if (cursor && toDelete > 0) {
-            cursor.delete();
-            toDelete--;
-            cursor.continue();
-          }
-        };
+      const ts = tx.objectStore(STORE);
+      const g = ts.get(messageId);
+      g.onsuccess = () => {
+        const r = g.result as CachedTranslation | undefined;
+        if (r) {
+          r.updatedAt = Date.now();
+          ts.put(r);
+        }
       };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Wipe cache + reset total. Do NOT call on logout (manual translations must
+ *  survive logout/login per PRD). Use only for explicit clear / migration. */
+export async function clearAll(): Promise<void> {
+  if (!idbAvailable()) return;
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE, META], 'readwrite');
+      tx.objectStore(STORE).clear();
+      tx.objectStore(META).put(0, TOTAL_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -217,33 +325,31 @@ export async function requestPersistentStorage(): Promise<boolean> {
 }
 
 // -----------------------------------------------------------------------------
-// Integration sketch (put this in your translation store / bubble, NOT here):
+// Integration sketch (in your translation store / bubble, NOT here):
 //
-//   import { getTranslation, setTranslation, deleteTranslation } from './idbTranslationCache';
+//   import { getTranslation, setTranslation, deleteTranslation, touch } from './idbTranslationCache';
 //
 //   // on translate success (inside the store's run()):
-//   setTranslation({ messageId, targetLang, translatedMarkdown: out, srcVersion });
+//   setTranslation({ messageId, targetLang, translatedMarkdown: out, srcVersion }); // auto-prunes at 50MB
 //
 //   // on revert() / onMessageEdited() / onMessageRemoved():
 //   deleteTranslation(messageId);
 //
 //   // read-through when a message enters the viewport and the store has no entry:
 //   async function hydrateFromCache(messageId: string, currentSrcVersion: string | number) {
-//     if (store.getState().byId[messageId]) return;              // already in memory
+//     if (store.getState().byId[messageId]) return;
 //     const c = await getTranslation(messageId);
-//     if (c && c.srcVersion === currentSrcVersion) {             // version match = valid
+//     if (c && c.srcVersion === currentSrcVersion) {
 //       store.getState().setEntry(messageId, {
-//         status: 'translated',
-//         targetLang: c.targetLang,
-//         translatedMarkdown: c.translatedMarkdown,
-//         srcVersion: c.srcVersion,
+//         status: 'translated', targetLang: c.targetLang,
+//         translatedMarkdown: c.translatedMarkdown, srcVersion: c.srcVersion,
 //       });
+//       // touch(messageId); // optional: make eviction least-recently-VIEWED
 //     } else if (c) {
-//       deleteTranslation(messageId);                            // stale (edited) → purge
+//       deleteTranslation(messageId); // stale (edited) → purge
 //     }
 //   }
 //
-// Multi-tab coherence (optional): after setTranslation/deleteTranslation, post the
-// messageId on a BroadcastChannel('msg-translations') so other tabs update their
-// in-memory store (IndexedDB does not broadcast writes on its own).
+// Multi-tab coherence (optional): broadcast messageId on BroadcastChannel('msg-translations')
+// after set/delete so other tabs update their in-memory store.
 // -----------------------------------------------------------------------------
