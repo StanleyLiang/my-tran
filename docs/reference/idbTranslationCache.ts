@@ -9,8 +9,7 @@
 //      under a ~50 MB oldest-first LRU cap. MAY be evicted; a miss just re-translates.
 //
 // Separated so LRU eviction can never silently un-translate a message the user
-// marked (PRD §4.2.2 "維持該狀態"). Persistence is local, survives logout/login,
-// NOT cross-device.
+// marked. Persistence is local, survives logout/login, NOT cross-device.
 //
 // Use `createTranslationCache(config)` for an isolated/configurable/testable
 // instance, or the default `translationCache` singleton for app-wide use.
@@ -478,50 +477,3 @@ export function createTranslationCache(config: TranslationCacheConfig = {}): Tra
 /** Default app-wide singleton. Configure via createTranslationCache() when you
  *  need a custom db name / cap / handlers, or an isolated instance for tests. */
 export const translationCache = createTranslationCache();
-
-// -----------------------------------------------------------------------------
-// Integration sketch (in your translation store / bubble, NOT here):
-//
-//   import { translationCache as cache } from './idbTranslationCache';
-//   // or: const cache = createTranslationCache({ onBlocked, onError: log });
-//
-//   // MANUAL translate success (inside the store's run()):
-//   cache.intent.set({ messageId, mode: 'manual', targetLang, srcVersion });   // authoritative
-//   cache.content.set({ messageId, targetLang, translatedMarkdown: out, srcVersion }); // cache
-//
-//   // Revert ("See original message"):
-//   cache.intent.remove(messageId);           // stop showing translated
-//   // cache.content.remove(messageId);        // optional: keep for instant re-show
-//
-//   // Edit (srcVersion changed) / removed — PRD §3.3 manual → original:
-//   cache.intent.remove(messageId);
-//   cache.content.remove(messageId);
-//
-//   // Read-through on view — INTENT decides display; content is just the fast path.
-//   // Invalidate ONLY on srcVersion (edit). Do NOT compare targetLang to the global
-//   // setting — switching language must not re-translate already-translated messages.
-//   async function hydrateOnView(messageId: string, currentSrcVersion: string | number) {
-//     if (store.getState().byId[messageId]) return;
-//     const intent = await cache.intent.get(messageId);
-//     if (!intent) return;                                    // no intent → show original
-//     if (intent.srcVersion !== currentSrcVersion) {           // edited since → revert
-//       await cache.intent.remove(messageId);
-//       await cache.content.remove(messageId);
-//       return;
-//     }
-//     const c = await cache.content.get(messageId);
-//     if (c && c.srcVersion === currentSrcVersion && c.targetLang === intent.targetLang) {
-//       store.getState().setEntry(messageId, {
-//         status: 'translated', targetLang: c.targetLang,
-//         translatedMarkdown: c.translatedMarkdown, srcVersion: c.srcVersion,
-//       });
-//     } else {
-//       store.getState().translate(messageId, intent.targetLang); // content evicted → re-translate (gated)
-//     }
-//   }
-//
-// AUTO mode (future): display is global (the auto setting), not per-message intent.
-// Reconcile via §3.2 — auto applies only to messages WITHOUT a manual intent. The
-// auto on/off + target-language SETTING persists AND syncs cross-device (§4.1.3),
-// unlike these per-message manual intents (local, not cross-device).
-// -----------------------------------------------------------------------------
