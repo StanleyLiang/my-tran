@@ -1,50 +1,69 @@
 // idbTranslationCache.ts
 // -----------------------------------------------------------------------------
-// Zero-dependency IndexedDB cache for message translation results.
+// Zero-dependency IndexedDB store for message translation. Two concerns, kept
+// deliberately SEPARATE:
+//
+//   1) intent  (object store `intent`)  — AUTHORITATIVE "display as translated"
+//      state the backend does not reconstruct. Tiny (no markdown). NEVER pruned.
+//      Presence means: show this message translated, in `targetLang`.
+//
+//   2) content (object store `translations`) — REBUILDABLE cache of the translated
+//      markdown. Under a ~50 MB LRU cap (oldest-first). MAY be evicted; on a miss
+//      the caller just re-translates.
+//
+// Why separate: if a single record were both the flag and the content, LRU
+// eviction would silently un-translate messages the user expects to stay
+// translated (violates PRD §4.2.2 "維持該狀態"). Intent is never evicted; content is.
+//
+// Persistence semantics match PRD: local, survives logout/login, NOT cross-device.
+//
 // Pure module — no React / zustand imports. Values must be structured-cloneable.
 //
-// Eviction policy:
-//   - Soft cap ~50 MB (byte-based), tracked via a running total in a `meta` store.
-//   - Prune OLDEST FIRST by `updatedAt` (byUpdatedAt index), up to 10,000/pass.
-//   - Triggered after a write pushes totalBytes over the cap.
+// Resilience: feature-detect + try/catch everywhere → any failure degrades to a
+// cache/intent miss; QuotaExceededError → prune+retry; corruption self-heal
+// (deleteDatabase once + reopen); onblocked via setBlockedHandler; onversionchange
+// closes so other tabs can upgrade.
 //
-// Resilience:
-//   - Feature-detect + try/catch everywhere → any failure degrades to "cache miss".
-//   - QuotaExceededError on write → prune then one retry.
-//   - Corruption self-heal: if open fails (non-VersionError), deleteDatabase once
-//     and reopen once. recoverDatabase() is also exposed for manual use.
-//   - onblocked (multi-tab upgrade/delete) → settable handler via setBlockedHandler.
-//   - onversionchange → close so another tab's upgrade isn't blocked.
-//
-// Migration:
-//   - Schema changes bump DB_VERSION; onupgradeneeded keys off event.oldVersion.
-//   - Prefer ADDITIVE + read-tolerant changes to avoid migrations.
-//   - For breaking changes, drop & rebuild is fine (losing a cache just re-translates).
+// Migration: schema changes bump DB_VERSION; onupgradeneeded keys off oldVersion.
+// Prefer additive + read-tolerant; breaking changes may drop & rebuild (a lost
+// cache just re-translates — but note: dropping also loses intent, reverting
+// manually-translated messages to original, so avoid unless necessary).
 // -----------------------------------------------------------------------------
 
+export type TranslateMode = 'manual' | 'auto';
+
+/** AUTHORITATIVE per-message display state (never pruned). */
+export interface DisplayIntent {
+  messageId: string;            // primary key
+  mode: TranslateMode;          // 'manual' now; 'auto' reserved for §3.2 reconciliation
+  targetLang: string;
+  srcVersion: string | number;  // message version when marked → edit invalidation
+  updatedAt: number;
+}
+
+/** REBUILDABLE cached translation content (under the 50 MB LRU cap). */
 export interface CachedTranslation {
   messageId: string;            // primary key (keyPath)
   targetLang: string;
   translatedMarkdown: string;
-  srcVersion: string | number;  // message version at translate time → edit invalidation
-  updatedAt: number;            // Date.now(); ORDERING KEY for oldest-first prune
-  size: number;                 // estimated bytes of this record (for the 50MB cap)
+  srcVersion: string | number;
+  updatedAt: number;            // ORDERING KEY for oldest-first prune
+  size: number;                 // estimated bytes (for the 50 MB cap)
 }
 
 const DB_NAME = 'msg-translations';
 const DB_VERSION = 1;                    // bump + migrate in onupgradeneeded on schema change
-const STORE = 'translations';
+const STORE = 'translations';           // content cache
+const INTENT = 'intent';                // authoritative display flags
 const META = 'meta';
 const LRU_INDEX = 'byUpdatedAt';
 const TOTAL_KEY = 'totalBytes';
 
-const CAP_BYTES = 50 * 1024 * 1024;      // 50 MB soft cap
-const PRUNE_BATCH = 10_000;              // delete up to this many oldest per prune
+const CAP_BYTES = 50 * 1024 * 1024;      // 50 MB soft cap (content only)
+const PRUNE_BATCH = 10_000;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
-// Called when an upgrade or delete is blocked by a connection in another tab.
-// The app can set this to, e.g., prompt "please close other tabs".
 let onBlocked: () => void = () => {};
 export function setBlockedHandler(fn: () => void): void {
   onBlocked = fn;
@@ -58,19 +77,19 @@ function idbAvailable(): boolean {
   }
 }
 
-// Conservative byte estimate (CJK ~2 bytes/char + fixed overhead).
 function estimateSize(r: Omit<CachedTranslation, 'size'>): number {
   const chars =
     r.messageId.length + r.targetLang.length + r.translatedMarkdown.length + String(r.srcVersion).length;
   return chars * 2 + 120;
 }
 
-// ---- schema helpers (used by onupgradeneeded) -------------------------------
+// ---- schema helpers ---------------------------------------------------------
 
 function createStores(db: IDBDatabase): void {
   const store = db.createObjectStore(STORE, { keyPath: 'messageId' });
   store.createIndex(LRU_INDEX, 'updatedAt', { unique: false });
-  db.createObjectStore(META); // out-of-line keys; we use the string TOTAL_KEY
+  db.createObjectStore(INTENT, { keyPath: 'messageId' }); // no LRU index — never pruned
+  db.createObjectStore(META); // out-of-line keys; we use TOTAL_KEY
 }
 
 function dropStores(db: IDBDatabase): void {
@@ -88,26 +107,19 @@ function rawOpen(): Promise<IDBDatabase> {
       const oldV = (event as IDBVersionChangeEvent).oldVersion;
 
       if (oldV < 1) {
-        // Fresh install → create v1 schema.
-        createStores(db);
+        createStores(db); // fresh install → v1 schema (content + intent + meta)
       }
 
-      // --- Future migrations go here, keyed by oldVersion --------------------
-      // ADDITIVE (keep data): add an index / store without touching the rest.
-      //   if (oldV >= 1 && oldV < 2) { db.createObjectStore('newThing'); }
-      //
-      // BREAKING (drop & rebuild — fine for a cache, users just re-translate):
-      //   if (oldV >= 1 && oldV < 3) { dropStores(db); createStores(db); }
-      //
-      // Backfill example (v1 had no `size`/`meta`): after createStores, scan the
-      // old store on req.transaction, sum estimateSize, write TOTAL_KEY. Keep it
-      // synchronous (enqueue IDB requests only) — no awaiting external work here.
-      // ----------------------------------------------------------------------
+      // --- Future migrations keyed by oldVersion --------------------------
+      // ADDITIVE (keep data): create a new index/store without touching the rest.
+      // BREAKING (drop & rebuild): dropStores(db); createStores(db);
+      //   ⚠ dropping loses INTENT too → manually-translated msgs revert to original.
+      //   Avoid unless the intent schema itself must change.
+      // --------------------------------------------------------------------
     };
 
     req.onsuccess = () => {
       const db = req.result;
-      // If another tab opens a newer version, close so we don't block its upgrade.
       db.onversionchange = () => {
         db.close();
         dbPromise = null;
@@ -115,7 +127,6 @@ function rawOpen(): Promise<IDBDatabase> {
       resolve(db);
     };
     req.onerror = () => reject(req.error);
-    // Our upgrade is blocked by an older connection in another tab.
     req.onblocked = () => onBlocked();
   });
 }
@@ -131,30 +142,26 @@ function deleteDatabaseRaw(): Promise<void> {
       return;
     }
     req.onsuccess = () => resolve();
-    req.onerror = () => resolve(); // best-effort
-    req.onblocked = () => onBlocked(); // waits for other connections to close, then success fires
+    req.onerror = () => resolve();
+    req.onblocked = () => onBlocked();
   });
 }
 
 function openDB(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   const p = rawOpen().catch(async (err: unknown) => {
-    // VersionError: a newer schema exists (another tab / newer app bundle owns it).
-    // Do NOT delete — that would destroy data the newer version needs.
-    if ((err as DOMException)?.name === 'VersionError') throw err;
-    // Otherwise treat as possible corruption: delete once and reopen once.
-    await deleteDatabaseRaw();
+    if ((err as DOMException)?.name === 'VersionError') throw err; // newer schema owns it
+    await deleteDatabaseRaw(); // possible corruption → delete once, reopen once
     return rawOpen();
   });
   dbPromise = p;
-  // If it still fails, clear so a later call can retry from scratch.
   p.catch(() => {
     if (dbPromise === p) dbPromise = null;
   });
   return p;
 }
 
-/** Manually drop the whole database and reset (e.g., on detected corruption). */
+/** Manually drop the whole database and reset (e.g. detected corruption). */
 export async function recoverDatabase(): Promise<void> {
   if (dbPromise) {
     try {
@@ -166,9 +173,82 @@ export async function recoverDatabase(): Promise<void> {
   await deleteDatabaseRaw();
 }
 
-// ---- reads ------------------------------------------------------------------
+// ---- intent (authoritative display flag; never pruned) ----------------------
 
-/** Read one message's cached translation (undefined on miss or any IDB error). */
+export async function getIntent(messageId: string): Promise<DisplayIntent | undefined> {
+  if (!idbAvailable()) return undefined;
+  try {
+    const db = await openDB();
+    return await new Promise<DisplayIntent | undefined>((resolve, reject) => {
+      const tx = db.transaction(INTENT, 'readonly');
+      const req = tx.objectStore(INTENT).get(messageId);
+      tx.oncomplete = () => resolve(req.result as DisplayIntent | undefined);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Batch read intents for a viewport in ONE transaction. */
+export async function getManyIntents(ids: string[]): Promise<Map<string, DisplayIntent>> {
+  const out = new Map<string, DisplayIntent>();
+  if (!idbAvailable() || ids.length === 0) return out;
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(INTENT, 'readonly');
+      const store = tx.objectStore(INTENT);
+      for (const id of ids) {
+        const r = store.get(id);
+        r.onsuccess = () => {
+          if (r.result) out.set(id, r.result as DisplayIntent);
+        };
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    /* degrade */
+  }
+  return out;
+}
+
+export async function setIntent(
+  entry: Omit<DisplayIntent, 'updatedAt'> & { updatedAt?: number },
+): Promise<void> {
+  if (!idbAvailable()) return;
+  const record: DisplayIntent = { ...entry, updatedAt: entry.updatedAt ?? Date.now() };
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(INTENT, 'readwrite');
+      tx.objectStore(INTENT).put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    /* ignore — degrade */
+  }
+}
+
+export async function deleteIntent(messageId: string): Promise<void> {
+  if (!idbAvailable()) return;
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(INTENT, 'readwrite');
+      tx.objectStore(INTENT).delete(messageId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---- content reads ----------------------------------------------------------
+
 export async function getTranslation(messageId: string): Promise<CachedTranslation | undefined> {
   if (!idbAvailable()) return undefined;
   try {
@@ -180,11 +260,10 @@ export async function getTranslation(messageId: string): Promise<CachedTranslati
       tx.onerror = () => reject(tx.error);
     });
   } catch {
-    return undefined; // degrade: every failure is a cache miss
+    return undefined;
   }
 }
 
-/** Batch read (hydrate a whole viewport in ONE transaction). */
 export async function getManyTranslations(ids: string[]): Promise<Map<string, CachedTranslation>> {
   const out = new Map<string, CachedTranslation>();
   if (!idbAvailable() || ids.length === 0) return out;
@@ -203,12 +282,11 @@ export async function getManyTranslations(ids: string[]): Promise<Map<string, Ca
       tx.onerror = () => reject(tx.error);
     });
   } catch {
-    /* degrade to whatever we collected */
+    /* degrade */
   }
   return out;
 }
 
-/** Current tracked cache size in bytes (0 on error). */
 export async function getTotalBytes(): Promise<number> {
   if (!idbAvailable()) return 0;
   try {
@@ -224,9 +302,8 @@ export async function getTotalBytes(): Promise<number> {
   }
 }
 
-// ---- writes -----------------------------------------------------------------
+// ---- content writes (byte-tracked, LRU-pruned) ------------------------------
 
-// Internal: upsert a record and update the running total in ONE transaction.
 function putRecordTx(record: CachedTranslation): Promise<number> {
   return openDB().then(
     (db) =>
@@ -252,7 +329,6 @@ function putRecordTx(record: CachedTranslation): Promise<number> {
   );
 }
 
-/** Upsert a translation. Stamps updatedAt, tracks bytes, prunes if over 50 MB. */
 export async function setTranslation(
   entry: Omit<CachedTranslation, 'updatedAt' | 'size'> & { updatedAt?: number },
 ): Promise<void> {
@@ -267,20 +343,17 @@ export async function setTranslation(
   const record: CachedTranslation = { ...base, size: estimateSize(base) };
   try {
     const total = await putRecordTx(record);
-    if (total > CAP_BYTES) void prune(); // batch-evict 10k oldest
+    if (total > CAP_BYTES) void prune();
   } catch {
-    // Likely QuotaExceededError → free space then retry once.
     try {
       await prune();
       await putRecordTx(record);
     } catch {
-      // give up silently; in-memory store still holds it this session.
-      // (Persistent open failures self-heal via openDB() corruption recovery.)
+      /* give up silently; in-memory store still holds it this session */
     }
   }
 }
 
-/** Remove one entry (use on revert / edit invalidation / delete). */
 export async function deleteTranslation(messageId: string): Promise<void> {
   if (!idbAvailable()) return;
   try {
@@ -292,7 +365,7 @@ export async function deleteTranslation(messageId: string): Promise<void> {
       const getOld = ts.get(messageId);
       getOld.onsuccess = () => {
         const old = getOld.result as CachedTranslation | undefined;
-        if (!old) return; // nothing to delete; tx completes
+        if (!old) return;
         ts.delete(messageId);
         const getTotal = ms.get(TOTAL_KEY);
         getTotal.onsuccess = () =>
@@ -307,11 +380,8 @@ export async function deleteTranslation(messageId: string): Promise<void> {
 }
 
 /**
- * Prune OLDEST-FIRST by updatedAt, up to PRUNE_BATCH (10,000) entries per pass,
- * decrementing the running total by the freed bytes. Returns entries deleted.
- *
- * One pass normally drops well under 50 MB. For a hard guarantee under
- * pathological record sizes, loop the caller:
+ * Prune CONTENT oldest-first by updatedAt, up to PRUNE_BATCH per pass. Intent is
+ * NEVER touched here. For a hard guarantee under cap:
  *   while ((await getTotalBytes()) > CAP_BYTES && (await prune()) > 0) {}
  */
 export async function prune(): Promise<number> {
@@ -321,10 +391,10 @@ export async function prune(): Promise<number> {
     return await new Promise<number>((resolve, reject) => {
       let deleted = 0;
       let freed = 0;
-      const tx = db.transaction([STORE, META], 'readwrite');
+      const tx = db.transaction([STORE, META], 'readwrite'); // NOTE: no INTENT here
       const ts = tx.objectStore(STORE);
       const ms = tx.objectStore(META);
-      const cursorReq = ts.index(LRU_INDEX).openCursor(null, 'next'); // ascending = oldest first
+      const cursorReq = ts.index(LRU_INDEX).openCursor(null, 'next');
       cursorReq.onsuccess = () => {
         const cursor = cursorReq.result;
         if (cursor && deleted < PRUNE_BATCH) {
@@ -347,8 +417,7 @@ export async function prune(): Promise<number> {
   }
 }
 
-/** Bump updatedAt to now WITHOUT changing size — turns oldest-written eviction
- *  into least-recently-VIEWED eviction. Optional: call on a cache hit. */
+/** Bump content updatedAt → least-recently-VIEWED eviction. Optional on cache hit. */
 export async function touch(messageId: string): Promise<void> {
   if (!idbAvailable()) return;
   try {
@@ -372,15 +441,15 @@ export async function touch(messageId: string): Promise<void> {
   }
 }
 
-/** Wipe cache + reset total. Do NOT call on logout (manual translations must
- *  survive logout/login per PRD). Use only for explicit clear / migration. */
+/** Wipe everything (content + intent + total). Do NOT call on logout. */
 export async function clearAll(): Promise<void> {
   if (!idbAvailable()) return;
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction([STORE, META], 'readwrite');
+      const tx = db.transaction([STORE, INTENT, META], 'readwrite');
       tx.objectStore(STORE).clear();
+      tx.objectStore(INTENT).clear();
       tx.objectStore(META).put(0, TOTAL_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -390,7 +459,6 @@ export async function clearAll(): Promise<void> {
   }
 }
 
-/** Best-effort: ask the browser not to evict our storage under pressure. */
 export async function requestPersistentStorage(): Promise<boolean> {
   try {
     if (navigator.storage?.persist) return await navigator.storage.persist();
@@ -403,37 +471,54 @@ export async function requestPersistentStorage(): Promise<boolean> {
 // -----------------------------------------------------------------------------
 // Integration sketch (in your translation store / bubble, NOT here):
 //
-//   import { getTranslation, setTranslation, deleteTranslation, setBlockedHandler } from './idbTranslationCache';
+//   import {
+//     getIntent, setIntent, deleteIntent,
+//     getTranslation, setTranslation, deleteTranslation, setBlockedHandler,
+//   } from './idbTranslationCache';
 //
 //   setBlockedHandler(() => showToast('Please close other tabs to update translation cache.'));
 //
-//   // on translate success (inside the store's run()):
-//   setTranslation({ messageId, targetLang, translatedMarkdown: out, srcVersion }); // auto-prunes at 50MB
+//   // MANUAL translate success (inside the store's run()):
+//   setIntent({ messageId, mode: 'manual', targetLang, srcVersion });   // authoritative
+//   setTranslation({ messageId, targetLang, translatedMarkdown: out, srcVersion }); // cache
 //
-//   // on revert() / onMessageEdited() / onMessageRemoved():
+//   // Revert ("See original message"):
+//   deleteIntent(messageId);            // stop showing translated
+//   // deleteTranslation(messageId);    // optional: keep content for instant re-show
+//
+//   // Edit (srcVersion changed) / message removed (PRD §3.3 manual → original):
+//   deleteIntent(messageId);
 //   deleteTranslation(messageId);
 //
-//   // read-through when a message enters the viewport and the store has no entry.
-//   // INVALIDATION POLICY (PRD §3.2 / §4.2.2.2): manual translations are STICKY per
-//   // message. Invalidate ONLY on srcVersion change (message edited). Do NOT compare
-//   // c.targetLang against the current global "Translate into" setting and re-translate
-//   // — switching the target language must NOT re-translate already-translated messages.
-//   // A message keeps whatever language it was translated into until the user explicitly
-//   // re-translates it (which overwrites this one-entry-per-message record).
-//   async function hydrateFromCache(messageId: string, currentSrcVersion: string | number) {
+//   // Read-through on view — INTENT decides display; content is just the fast path.
+//   // Invalidate ONLY on srcVersion (edit). Do NOT compare targetLang to the global
+//   // setting — switching language must not re-translate already-translated messages.
+//   async function hydrateOnView(messageId: string, currentSrcVersion: string | number) {
 //     if (store.getState().byId[messageId]) return;
+//     const intent = await getIntent(messageId);
+//     if (!intent) return;                                   // no intent → show original
+//     if (intent.srcVersion !== currentSrcVersion) {          // edited since → revert
+//       await deleteIntent(messageId);
+//       await deleteTranslation(messageId);
+//       return;                                               // show original
+//     }
 //     const c = await getTranslation(messageId);
-//     if (c && c.srcVersion === currentSrcVersion) {
+//     if (c && c.srcVersion === currentSrcVersion && c.targetLang === intent.targetLang) {
 //       store.getState().setEntry(messageId, {
 //         status: 'translated', targetLang: c.targetLang,
 //         translatedMarkdown: c.translatedMarkdown, srcVersion: c.srcVersion,
 //       });
-//       // touch(messageId); // optional: make eviction least-recently-VIEWED
-//     } else if (c) {
-//       deleteTranslation(messageId); // stale (edited) → purge
+//     } else {
+//       // content evicted/missing but intent says translated → re-translate (gated via #20).
+//       store.getState().translate(messageId, intent.targetLang); // repopulates content on success
 //     }
 //   }
 //
-// Multi-tab coherence (optional): broadcast messageId on BroadcastChannel('msg-translations')
-// after set/delete so other tabs update their in-memory store.
+// AUTO mode (future): display is global (the auto setting), not per-message intent.
+// Reconcile via §3.2 — auto applies only to messages WITHOUT a manual intent.
+// The auto on/off + target-language SETTING persists AND syncs cross-device (§4.1.3),
+// unlike these per-message manual intents (local, not cross-device).
+//
+// Multi-tab coherence (optional): broadcast messageId on BroadcastChannel after
+// set/delete of intent or content so other tabs update their in-memory store.
 // -----------------------------------------------------------------------------
