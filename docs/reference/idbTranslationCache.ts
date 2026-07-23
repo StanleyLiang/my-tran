@@ -335,7 +335,13 @@ export async function requestPersistentStorage(): Promise<boolean> {
 //   // on revert() / onMessageEdited() / onMessageRemoved():
 //   deleteTranslation(messageId);
 //
-//   // read-through when a message enters the viewport and the store has no entry:
+//   // read-through when a message enters the viewport and the store has no entry.
+//   // INVALIDATION POLICY (PRD §3.2 / §4.2.2.2): manual translations are STICKY per
+//   // message. Invalidate ONLY on srcVersion change (message edited). Do NOT compare
+//   // c.targetLang against the current global "Translate into" setting and re-translate
+//   // — switching the target language must NOT re-translate already-translated messages.
+//   // A message keeps whatever language it was translated into until the user explicitly
+//   // re-translates it (which overwrites this one-entry-per-message record).
 //   async function hydrateFromCache(messageId: string, currentSrcVersion: string | number) {
 //     if (store.getState().byId[messageId]) return;
 //     const c = await getTranslation(messageId);
